@@ -2,8 +2,9 @@ local Players = game:GetService("Players")
 local localplr = Players.LocalPlayer
 local cfolder = workspace:WaitForChild("Bricks")
 local termiteRunning = false
+local THREADS = 100
 
-local function getDeleteEvent()
+local function getDeleteTool()
 	if localplr.Character then
 		for _, v in ipairs(localplr.Character:GetChildren()) do
 			if v:IsA("Tool") and v.Name == "Delete" then
@@ -11,8 +12,6 @@ local function getDeleteEvent()
 				if scr and scr:FindFirstChild("Event") then
 					return scr.Event, v
 				end
-				local ev = v:FindFirstChildWhichIsA("RemoteEvent")
-				if ev then return ev, v end
 			end
 		end
 	end
@@ -22,98 +21,141 @@ local function getDeleteEvent()
 			if scr and scr:FindFirstChild("Event") then
 				return scr.Event, v
 			end
-			local ev = v:FindFirstChildWhichIsA("RemoteEvent")
-			if ev then return ev, v end
 		end
 	end
 	return nil, nil
 end
 
-local function countAllBricks()
-	local count = 0
-	for _, v in ipairs(cfolder:GetDescendants()) do
-		if v:IsA("BasePart") then
-			count = count + 1
+-- Partial name match against player folders in workspace.Bricks
+local function findPlayerFolder(name)
+	name = name:lower()
+	for _, folder in ipairs(cfolder:GetChildren()) do
+		if folder.Name:lower():sub(1, #name) == name then
+			return folder
 		end
 	end
-	return count
+	return nil
 end
 
-local function runTermite()
-	if termiteRunning then
-		warn("[Termite] Already running.")
+local function collectBricks(targetFolder)
+	local bricks = {}
+	local n = 0
+	if targetFolder then
+		for _, v in ipairs(targetFolder:GetDescendants()) do
+			if v:IsA("BasePart") then
+				n = n + 1
+				bricks[n] = v
+			end
+		end
+	else
+		for _, v in ipairs(cfolder:GetDescendants()) do
+			if v:IsA("BasePart") then
+				n = n + 1
+				bricks[n] = v
+			end
+		end
+	end
+	return bricks, n
+end
+
+local function nukeBricks(bricks, n, label)
+	if n == 0 then
+		print("[Termite] No bricks found for " .. label)
+		termiteRunning = false
 		return
 	end
 
-	local event, tool = getDeleteEvent()
-	if not event then
-		warn("[Termite] No Delete tool found. Aborting.")
-		return
-	end
-
-	local total = countAllBricks()
-	if total == 0 then
-		print("[Termite] No bricks found on the map.")
-		return
-	end
-
-	print("[Termite] Found " .. total .. " bricks. Starting...")
+	print("[Termite] Found " .. n .. " bricks for " .. label .. ". Nuking...")
 	termiteRunning = true
-	local dti = 0
 
-	coroutine.wrap(function()
+	task.spawn(function()
 		while termiteRunning do
-			event, tool = getDeleteEvent()
-			if not event then
-				warn("[Termite] Lost Delete tool. Stopping.")
+			local event, tool = getDeleteTool()
+			if not event or not tool then
+				warn("[Termite] Lost Delete tool.")
 				termiteRunning = false
 				break
 			end
 
-			local hrp = localplr.Character and localplr.Character:FindFirstChild("HumanoidRootPart")
-			local pos = (hrp and hrp.Position) or Vector3.zero
-			local foundAny = false
+			tool.Parent = localplr.Character
+			tool.Parent = localplr.Backpack
 
-			for _, v in ipairs(cfolder:GetDescendants()) do
-				if not termiteRunning then break end
-				if v and v.Parent and v:IsA("BasePart") then
-					foundAny = true
-					dti = dti + 1
+			local hrp = localplr.Character:FindFirstChild("HumanoidRootPart")
+			local pos = hrp and hrp.Position or Vector3.zero
 
-					if dti % 30 == 0 then
-						event, tool = getDeleteEvent()
-						hrp = localplr.Character and localplr.Character:FindFirstChild("HumanoidRootPart")
-						pos = (hrp and hrp.Position) or Vector3.zero
-						if not event then
-							termiteRunning = false
-							break
-						end
-					end
+			-- Refresh brick list every sweep to catch stragglers
+			bricks, n = collectBricks(label == "ALL" and nil or findPlayerFolder(label))
 
-					pcall(function()
-						event:FireServer(v, pos)
-					end)
-
-					task.wait()
-				end
-			end
-
-			if not foundAny or countAllBricks() == 0 then
+			if n == 0 then
 				print("[Termite] All bricks deleted. Stopped.")
 				termiteRunning = false
 				break
 			end
 
+			local chunkSize = math.ceil(n / THREADS)
+
+			for t = 1, THREADS do
+				local s = (t - 1) * chunkSize + 1
+				local e = math.min(t * chunkSize, n)
+				if s > n then continue end
+
+				task.spawn(function()
+					for i = s, e do
+						local b = bricks[i]
+						if b and b.Parent then
+							event:FireServer(b, pos)
+						end
+					end
+				end)
+			end
+
 			task.wait()
 		end
-	end)()
+	end)
+end
+
+local function runTermite(targetName)
+	if termiteRunning then
+		warn("[Termite] Already running.")
+		return
+	end
+
+	local event, tool = getDeleteTool()
+	if not event or not tool then
+		warn("[Termite] No Delete tool found. Aborting.")
+		return
+	end
+
+	if targetName then
+		local folder = findPlayerFolder(targetName)
+		if not folder then
+			warn("[Termite] No folder found for player: " .. targetName)
+			return
+		end
+		local bricks, n = collectBricks(folder)
+		nukeBricks(bricks, n, targetName)
+	else
+		local bricks, n = collectBricks(nil)
+		nukeBricks(bricks, n, "ALL")
+	end
 end
 
 localplr.Chatted:Connect(function(msg)
 	local cmd = msg:lower():gsub("%s+", " "):match("^%s*(.-)%s*$")
 
+	-- destroy cubes all
 	if cmd == "destroy cubes" or cmd == ";destroy cubes" then
-		runTermite()
+		runTermite(nil)
+
+	-- destroy cubes (playername)
+	elseif cmd:sub(1, 14) == "destroy cubes " then
+		local target = cmd:sub(15)
+		runTermite(target)
+	elseif cmd:sub(1, 15) == ";destroy cubes " then
+		local target = cmd:sub(16)
+		runTermite(target)
+
+	-- stop
 	elseif cmd == "destroy cubes stop" or cmd == ";destroy cubes stop" then
 		if termiteRunning then
 			termiteRunning = false
